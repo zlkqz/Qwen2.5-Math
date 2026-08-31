@@ -7,3 +7,9 @@ tensorflow/my_graph/*
 .idea/
 # IPython Notebook
 .ipynb_checkpoints
+
+*.out
+*.err
+*.log
+
+evaluation/outputs/

@@ -1,13 +1,12 @@
 import random
 import os
+import re
 import argparse
 import time
-from vllm import LLM, SamplingParams
+import concurrent.futures
+import requests
 from datetime import datetime
 from tqdm import tqdm
-
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from evaluate import evaluate
 from utils import set_seed, load_jsonl, save_jsonl, construct_prompt
@@ -15,7 +14,10 @@ from parser import *
 from trajectory import *
 from data_loader import load_data
 from python_executor import PythonExecutor
-from model_utils import load_hf_lm_and_tokenizer, generate_completions
+# vllm / torch / transformers / model_utils are only needed by the
+# --use_vllm and local-HF backends, and are not installed in API-only
+# environments (see requirements.txt) - import them lazily where used so
+# `--use_api` runs without pulling them in.
 
 
 def parse_args():
@@ -36,6 +38,12 @@ def parse_args():
     parser.add_argument("--max_tokens_per_call", default=2048, type=int)
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--use_vllm", action="store_true")
+    parser.add_argument("--use_api", action="store_true")
+    parser.add_argument("--api_base_url", default="http://localhost:8000/v1", type=str)
+    parser.add_argument("--api_key", default="EMPTY", type=str)
+    parser.add_argument("--model_name", default="openai", type=str)
+    parser.add_argument("--api_concurrency", default=32, type=int)
+    parser.add_argument("--enable_thinking", action="store_true")
     parser.add_argument("--save_outputs", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--use_safetensors", action="store_true")
@@ -105,10 +113,64 @@ def prepare_data(data_name, args):
     return examples, processed_samples, out_file
 
 
+_CHATML_TURN_RE = re.compile(
+    r"<\|im_start\|>(system|user)\n(.*?)<\|im_end\|>\n", re.S
+)
+
+
+def prompt_to_messages(prompt):
+    """`construct_prompt` pre-renders the full ChatML text (system/user turns
+    plus the trailing "<|im_start|>assistant\n" generation prefix) for the raw
+    --use_vllm backend, which tokenizes it as-is with no chat template applied.
+    The chat/completions API applies the server's chat template on top of
+    `messages`, so feeding it that already-rendered text as a single user
+    message would template it a second time. Split it back into proper
+    system/user turns (dropping the assistant-prefix suffix, which the
+    server's own template re-adds) so the template is only applied once.
+    """
+    turns = _CHATML_TURN_RE.findall(prompt)
+    if not turns:
+        return [{"role": "user", "content": prompt}]
+    return [{"role": role, "content": content} for role, content in turns]
+
+
+def call_api(args, prompt, stop_words):
+    url = f"{args.api_base_url.rstrip('/')}/chat/completions"
+    headers = {"Authorization": f"Bearer {args.api_key}", "Content-Type": "application/json"}
+    data = {
+        "model": args.model_name,
+        "messages": prompt_to_messages(prompt),
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "max_tokens": args.max_tokens_per_call,
+        "stop": stop_words,
+        # Different vLLM versions expose the Qwen3-style thinking switch
+        # differently: some read it directly off the request body, others
+        # only honor it inside chat_template_kwargs (forwarded verbatim to
+        # tokenizer.apply_chat_template). Send both so whichever the running
+        # server understands actually takes effect; the other is ignored.
+        "enable_thinking": args.enable_thinking,
+        "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
+    }
+    while True:
+        try:
+            resp = requests.post(url, headers=headers, json=data, timeout=600)
+            resp.raise_for_status()
+            message = resp.json()["choices"][0]["message"]
+            return message.get("content") or message.get("reasoning_content") or ""
+        except Exception as e:
+            print(f"[API] request failed: {e}, retrying in 3s...")
+            time.sleep(3)
+
+
 def setup(args):
     # load model
-    available_gpus = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-    if args.use_vllm:
+    if args.use_api:
+        llm, tokenizer = None, None
+    elif args.use_vllm:
+        from vllm import LLM
+
+        available_gpus = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
         llm = LLM(
             model=args.model_name_or_path,
             tensor_parallel_size=len(available_gpus) // args.pipeline_parallel_size,
@@ -117,10 +179,14 @@ def setup(args):
         )
         tokenizer = None
         if args.apply_chat_template:
+            from transformers import AutoTokenizer
+
             tokenizer = AutoTokenizer.from_pretrained(
                 args.model_name_or_path, trust_remote_code=True
             )
     else:
+        from model_utils import load_hf_lm_and_tokenizer
+
         llm, tokenizer = load_hf_lm_and_tokenizer(
             model_name_or_path=args.model_name_or_path,
             load_in_half=True,
@@ -258,6 +324,8 @@ def main(llm, tokenizer, data_name, args):
         # get all outputs
         prompts = [item[1] for item in current_prompts]
         if args.use_vllm:
+            from vllm import SamplingParams
+
             outputs = llm.generate(
                 prompts,
                 SamplingParams(
@@ -278,7 +346,24 @@ def main(llm, tokenizer, data_name, args):
                 outputs, key=lambda x: int(x.request_id)
             )  # sort outputs by request_id
             outputs = [output.outputs[0].text for output in outputs]
+        elif args.use_api:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=args.api_concurrency
+            ) as pool:
+                future_to_idx = {
+                    pool.submit(call_api, args, prompt, stop_words): i
+                    for i, prompt in enumerate(prompts)
+                }
+                outputs = [None] * len(prompts)
+                for future in tqdm(
+                    concurrent.futures.as_completed(future_to_idx),
+                    total=len(prompts),
+                    desc=f"API inference (epoch {epoch})",
+                ):
+                    outputs[future_to_idx[future]] = future.result()
         else:
+            from model_utils import generate_completions
+
             outputs = generate_completions(
                 model=llm,
                 tokenizer=tokenizer,

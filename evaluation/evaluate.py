@@ -6,6 +6,8 @@ from concurrent.futures import TimeoutError
 
 from grader import *
 
+import glob
+
 from parser import *
 from utils import load_jsonl
 from python_executor import PythonExecutor
@@ -99,7 +101,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_name", type=str, default="math")
     parser.add_argument("--prompt_type", type=str, default="tool-integrated")
-    parser.add_argument("--file_path", type=str, default=None, required=True)
+    parser.add_argument("--base_file_dir", type=str, default=None, required=True)
     parser.add_argument("--max_num_samples", type=int, default=None)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
@@ -107,5 +109,13 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    evaluate(data_name=args.data_name, prompt_type=args.prompt_type, file_path=args.file_path,
+    file_path = os.path.join(args.base_file_dir, args.data_name, "*.jsonl")
+    print(f"Absolute directory path: {os.path.abspath(file_path)}")
+    glob_files = glob.glob(file_path)
+    if len(glob_files) == 0:
+        raise FileNotFoundError(f"No files found in {file_path}")
+    elif len(glob_files) > 1:
+        raise ValueError(f"Multiple files found in {file_path}: {glob_files}. Please specify a single file.")
+    file_path = glob_files[0]
+    evaluate(data_name=args.data_name, prompt_type=args.prompt_type, file_path=file_path,
              max_num_samples=args.max_num_samples, execute=args.execute)
